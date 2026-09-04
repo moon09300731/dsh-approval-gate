@@ -290,7 +290,7 @@ function extractFiles(text) {
  * bash/exec 等带 command 字段的工具 → 从命令文本提取路径。
  * 未命中（无 callId / 事件缺失 / 参数解析失败）返回 null，调用方回退 justification 提取（C 层兜底）。
  * @param {string|null|undefined} callId approval 请求关联的工具调用 ID
- * @param {Array} events 会话事件列表（session.events）
+ * @param {Array} events 会话事件列表（session.snapshotEvents() 的产物；旧版 Session 曾直接暴露 .events）
  * @returns {string[]|null} 结构化路径数组（未命中返回 null）
  */
 function resolveToolCallFiles(callId, events) {
@@ -1287,7 +1287,7 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
           console.error(`[${NAME}] permissionPresets.current failed`, error)
           return next()
@@ -1299,11 +1299,17 @@ export default {
         const reason = String(req.reason || '')
         const { mode, justification } = parseReason(reason)
         const sessionId = typeof session.id === 'string' ? session.id : ''
-        // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd）
-        const sessionCwd = (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd；旧版 Session 直接暴露 .cwd）
+        const sessionCwd = (typeof session.cwd === 'string' && session.cwd)
+          ? session.cwd
+          : (session.header && typeof session.header.cwd === 'string' ? session.header.cwd : '')
+        // 会话事件日志：DSH Session 通过 snapshotEvents() 方法暴露（无 .events 属性）；旧版兼容保留 .events 分支
+        const sessionEvents = Array.isArray(session.events)
+          ? session.events
+          : (typeof session.snapshotEvents === 'function' ? session.snapshotEvents() : [])
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
-        const toolFiles = resolveToolCallFiles(req.callId, session.events)
+        const toolFiles = resolveToolCallFiles(req.callId, sessionEvents)
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
