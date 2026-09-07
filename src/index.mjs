@@ -1285,18 +1285,26 @@ export default {
         reloadConfig()
         const session = req.agent && req.agent.session
         if (!session) return next()
+        const toolName = String(req.toolName || 'unknown')
+        const reason = String(req.reason || '')
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          // DSH 的 permissionPresets.current(session) 入参是整个 session 对象；
+          // 传 session.events 会抛错，命中外层 catch 静默 return next()，插件永不接管、从不记录。
+          if (session && typeof permissionPresets.current === 'function') {
+            preset = permissionPresets.current(session)
+          } else {
+            preset = permissionPresets.current(session.events)
+          }
         } catch (error) {
           console.error(`[${NAME}] permissionPresets.current failed`, error)
           return next()
         }
-        if (preset !== PRESET_NAME) return next()
+        if (preset !== PRESET_NAME) {
+          audit(`SKIP    preset=${preset}（需 ${PRESET_NAME}）${toolName} ${reason.slice(0, 120)}`)
+          return next()
+        }
         if (req.signal && req.signal.aborted) return next()
-
-        const toolName = String(req.toolName || 'unknown')
-        const reason = String(req.reason || '')
         const { mode, justification } = parseReason(reason)
         const sessionId = typeof session.id === 'string' ? session.id : ''
         // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd）
