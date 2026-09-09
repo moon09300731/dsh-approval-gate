@@ -1116,26 +1116,44 @@ export default {
      */
     const callFlash = async (userText, systemPrompt, signal) => {
       const { provider, model } = resolveModel()
-      let text = ''
-      for await (const chunk of llm.stream({
-        provider,
-        model,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        system: systemPrompt,
-        temperature: 0,
-        reasoningEffort: 'off',
-        // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
-        maxTokens: 256,
-        signal
-      })) {
-        if (chunk.type === 'text-delta') text += chunk.text
-        else if (chunk.type === 'reasoning-delta') text += chunk.text
-        else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+      // 中转/自定义 provider 的能力表常不声明 reasoning effort "off"，dsh llm 在发出请求前
+      // 即抛 UNSUPPORTED_REASONING_EFFORT。先按 off 尝试；被拒则去掉该参数重试一次（回退
+      // 尝试忽略 reasoning-delta，避免思考文本污染 SAFE/RISKY 判定文本）。
+      const attempts = [
+        { reasoningEffort: 'off', collectReasoning: true },
+        { reasoningEffort: undefined, collectReasoning: false }
+      ]
+      let lastError = null
+      for (const attempt of attempts) {
+        let text = ''
+        try {
+          for await (const chunk of llm.stream({
+            provider,
+            model,
+            messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+            system: systemPrompt,
+            temperature: 0,
+            ...(attempt.reasoningEffort === undefined ? {} : { reasoningEffort: attempt.reasoningEffort }),
+            // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
+            maxTokens: 256,
+            signal
+          })) {
+            if (chunk.type === 'text-delta') text += chunk.text
+            else if (chunk.type === 'reasoning-delta' && attempt.collectReasoning) text += chunk.text
+            else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
+              const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
+              throw new Error('flash 调用失败: ' + failure)
+            }
+          }
+          return text
+        } catch (error) {
+          lastError = error
+          const failureText = String((error && error.message) || error)
+          // 仅对「不支持 reasoning effort」降级到默认 effort 重试；其余错误原样抛出（fail-safe）
+          if (!failureText.includes('does not support reasoning effort')) throw error
         }
       }
-      return text
+      throw lastError
     }
 
     /**
