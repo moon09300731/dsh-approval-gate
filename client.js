@@ -771,11 +771,9 @@ window.__ModuleLoader__.load({
         // 跑完，会让每次审批都 fail-safe 转人工。
         React.createElement('div', { className: 'ag-set-card' },
           React.createElement('div', { className: 'ag-set-card-head' },
-            React.createElement('div', { className: 'ag-set-card-title' },
-              React.createElement('span', { className: 'ag-set-stage' }, '④ Flash 判定模型'),
-              '裁判模型 · 与主力模型解耦'),
+            React.createElement('div', { className: 'ag-set-card-title' }, '裁判模型 · 与主力模型解耦'),
             React.createElement('p', { className: 'ag-set-card-sub' },
-              '执行管道第四步（风险判定）的模型。留空则跟随 agent 默认模型；建议固定为一个单次请求即可回答的模型——多步工具循环型模型（如 agy）在判定超时内跑不完，会导致每次审批都转人工。')),
+              '执行风险判定（管道末步）的模型。留空则跟随 agent 默认模型；建议固定为一个单次请求即可回答的模型——多步工具循环型模型（如 agy）在判定超时内跑不完，会导致每次审批都转人工。')),
           modelCatalog === null
             ? React.createElement('div', { className: 'ag-set-empty' },
                 '正在加载可用模型…（若长时间无响应，可直接编辑配置文件的 judgeModel 字段）')
