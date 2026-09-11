@@ -1285,11 +1285,15 @@ export default {
         reloadConfig()
         const session = req.agent && req.agent.session
         if (!session) return next()
+        // PermissionPresetService.current() 接受的是 **Session 对象**（内部走
+        // sessionProjections.stateOf(session,'permissions')，会读 session.header）；
+        // 传 session.events 会抛 `Cannot read properties of undefined (reading 'header')`，
+        // 被下面的 catch 吞掉后每次审批都静默转人工（判定/计数/审计全部不执行）。
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
-          console.error(`[${NAME}] permissionPresets.current failed`, error)
+          console.error(`[${NAME}] permissionPresets.current(session) failed`, error)
           return next()
         }
         if (preset !== PRESET_NAME) return next()
