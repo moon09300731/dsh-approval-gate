@@ -1130,9 +1130,15 @@ export default {
       })) {
         if (chunk.type === 'text-delta') text += chunk.text
         else if (chunk.type === 'reasoning-delta') text += chunk.text
-        else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+        else if (chunk.type === 'finish') {
+          // reason 是可选字段：官方 provider 正常结束发 {kind:'stop'}，异常/中止发
+          // {kind:'error'|'aborted'}；但部分 provider（如 vision-toolkit 的图片变体）的
+          // finish chunk 不带 reason，直接读 chunk.reason.kind 会抛 TypeError 使判定立即失败。
+          const kind = chunk.reason && chunk.reason.kind ? chunk.reason.kind : ''
+          if (kind === 'error' || kind === 'aborted') {
+            const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : kind
+            throw new Error('flash 调用失败: ' + failure)
+          }
         }
       }
       return text
