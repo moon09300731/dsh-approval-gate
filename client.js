@@ -643,6 +643,10 @@ window.__ModuleLoader__.load({
       const [newRule, setNewRule] = React.useState({ tool: '', mode: '', category: '', contains: '' })
       const [threshold, setThreshold] = React.useState('3')
       const [timeoutMs, setTimeoutMs] = React.useState('20000')
+      // 判定模型（与 agent 自身模型解耦）：'' = 跟随 agent 默认模型
+      const [modelCatalog, setModelCatalog] = React.useState(null)
+      const [judgeProvider, setJudgeProvider] = React.useState('')
+      const [judgeModel, setJudgeModel] = React.useState('')
 
       const load = function () {
         fetch('/api/auto-approve/rules', { headers: { 'cache-control': 'no-cache' } })
@@ -652,6 +656,8 @@ window.__ModuleLoader__.load({
               setSnapshot(data)
               setThreshold(String(data.config.riskyThreshold))
               setTimeoutMs(String(data.config.judgeTimeoutMs))
+              setJudgeProvider(data.config.judgeModel ? String(data.config.judgeModel.provider) : '')
+              setJudgeModel(data.config.judgeModel ? String(data.config.judgeModel.model) : '')
               setError(null)
             } else {
               setError('加载规则失败：' + JSON.stringify(data).slice(0, 200))
@@ -660,6 +666,14 @@ window.__ModuleLoader__.load({
           .catch(function (e) { setError('加载规则失败：' + String((e && e.message) || e)) })
       }
       React.useEffect(function () { load() }, [])
+
+      // 模型目录与对话框右下角的模型选择器同源（后端向 llm 服务查询）。
+      React.useEffect(function () {
+        fetch('/api/auto-approve/models', { headers: { 'cache-control': 'no-cache' } })
+          .then(function (r) { return r.json() })
+          .then(function (data) { if (data && data.providers) setModelCatalog(data.providers) })
+          .catch(function () { /* 目录拉取失败时退化为纯文本输入 */ })
+      }, [])
 
       const showFeedback = function (msg, ok) {
         setFeedback({ msg: String(msg), ok: ok !== false })
@@ -749,6 +763,63 @@ window.__ModuleLoader__.load({
               return React.createElement('span', { className: 'ag-set-hc', key: c },
                 c + (isPre ? '' : ' · 自定义'))
             })),
+        ),
+
+        // ---- 判定模型（judgeModel） ----
+        // 管道第四步（Flash 判定）由哪个模型执行。与 agent 自身模型解耦：
+        // agent 模型可能是多步工具循环（如 antigravity/agy），单次判定等不到它
+        // 跑完，会让每次审批都 fail-safe 转人工。
+        React.createElement('div', { className: 'ag-set-card' },
+          React.createElement('div', { className: 'ag-set-card-head' },
+            React.createElement('div', { className: 'ag-set-card-title' }, '裁判模型 · 与主力模型解耦'),
+            React.createElement('p', { className: 'ag-set-card-sub' },
+              '执行风险判定（管道末步）的模型。留空则跟随 agent 默认模型；建议固定为一个单次请求即可回答的模型——多步工具循环型模型（如 agy）在判定超时内跑不完，会导致每次审批都转人工。')),
+          modelCatalog === null
+            ? React.createElement('div', { className: 'ag-set-empty' },
+                '正在加载可用模型…（若长时间无响应，可直接编辑配置文件的 judgeModel 字段）')
+            : React.createElement('div', { className: 'ag-set-row' },
+                React.createElement('select', {
+                  className: 'ag-set-input',
+                  value: judgeProvider,
+                  onChange: function (e) {
+                    setJudgeProvider(e.target.value)
+                    setJudgeModel('')
+                  },
+                },
+                  React.createElement('option', { value: '' }, '跟随 agent 默认模型'),
+                  modelCatalog.map(function (p) {
+                    return React.createElement('option', { key: p.id, value: p.id }, p.id)
+                  }),
+                ),
+                React.createElement('select', {
+                  className: 'ag-set-input',
+                  value: judgeModel,
+                  disabled: judgeProvider === '',
+                  onChange: function (e) { setJudgeModel(e.target.value) },
+                },
+                  React.createElement('option', { value: '' }, judgeProvider === '' ? '—' : '选择模型…'),
+                  (modelCatalog.filter(function (p) { return p.id === judgeProvider })[0] || { models: [] }).models
+                    .map(function (m) {
+                      return React.createElement('option', { key: m.id, value: m.id }, m.name || m.id)
+                    }),
+                ),
+                React.createElement('button', {
+                  type: 'button',
+                  className: 'ag-set-btn',
+                  disabled: busy || (judgeProvider !== '' && judgeModel === ''),
+                  onClick: function () {
+                    api({
+                      op: 'set',
+                      kind: 'judgeModel',
+                      value: judgeProvider === '' ? null : { provider: judgeProvider, model: judgeModel },
+                    })
+                  },
+                }, '保存'),
+              ),
+          React.createElement('div', { className: 'ag-set-item-meta' },
+            (cfg.judgeModel && cfg.judgeModel.provider && cfg.judgeModel.model)
+              ? ('当前判定模型：' + cfg.judgeModel.provider + ' / ' + cfg.judgeModel.model)
+              : '当前判定模型：跟随 agent 默认模型'),
         ),
 
         // ---- 黑名单（denyKeywords） ----
