@@ -167,7 +167,7 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 ## Technical Notes
 
 - Mounted at the front of the `approval/request` waterfall (`prepend: true`, before the web answerer)
-- Gate: `permissionPresets.current(session.events) === 'auto-approve'`
+- Gate: `permissionPresets.current(session) === 'auto-approve'` (pass the **Session object**: the API reads `sessionProjections.stateOf(session,'permissions')` internally, so `session.events` throws `reading 'header'`)
 - DSH approval fires on sandbox escalation; `reason` is always `escalate sandbox to <mode>: <justification>`, with `mode` in `workspace-write` / `danger-full-access`
 - flash judgment: `reasoningEffort: 'off'` + `maxTokens: 256`, outputs `SAFE` or `RISKY:<category>`
 - Timeout: `AbortController` signal into `llm.stream` (cancellable), `Promise.race` + `ctx.timeout(judgeTimeoutMs)`, abort + one retry

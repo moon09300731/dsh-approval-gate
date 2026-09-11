@@ -1130,9 +1130,15 @@ export default {
       })) {
         if (chunk.type === 'text-delta') text += chunk.text
         else if (chunk.type === 'reasoning-delta') text += chunk.text
-        else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+        else if (chunk.type === 'finish') {
+          // reason 是可选字段：官方 provider 正常结束发 {kind:'stop'}，异常/中止发
+          // {kind:'error'|'aborted'}；但部分 provider（如 vision-toolkit 的图片变体）的
+          // finish chunk 不带 reason，直接读 chunk.reason.kind 会抛 TypeError 使判定立即失败。
+          const kind = chunk.reason && chunk.reason.kind ? chunk.reason.kind : ''
+          if (kind === 'error' || kind === 'aborted') {
+            const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : kind
+            throw new Error('flash 调用失败: ' + failure)
+          }
         }
       }
       return text
@@ -1285,11 +1291,15 @@ export default {
         reloadConfig()
         const session = req.agent && req.agent.session
         if (!session) return next()
+        // PermissionPresetService.current() 接受的是 **Session 对象**（内部走
+        // sessionProjections.stateOf(session,'permissions')，会读 session.header）；
+        // 传 session.events 会抛 `Cannot read properties of undefined (reading 'header')`，
+        // 被下面的 catch 吞掉后每次审批都静默转人工（判定/计数/审计全部不执行）。
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
-          console.error(`[${NAME}] permissionPresets.current failed`, error)
+          console.error(`[${NAME}] permissionPresets.current(session) failed`, error)
           return next()
         }
         if (preset !== PRESET_NAME) return next()
