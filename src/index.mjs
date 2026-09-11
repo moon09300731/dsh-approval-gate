@@ -436,6 +436,7 @@ function getRulesSnapshot() {
       hardCategories: config.hardCategories || [],
       riskyThreshold: config.riskyThreshold || 3,
       judgeTimeoutMs: config.judgeTimeoutMs || 20000,
+      judgeModel: config.judgeModel || null,
       learning: { enabled: learning.enabled !== false }
     },
     learning: {
@@ -507,9 +508,27 @@ function ensureAutoApprovePreset() {
   }
 }
 
-/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs */
+/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|judgeModel */
 function applyRuleOp(op, kind, value) {
   reloadConfig()
+
+  // 判定模型：与 agent 自身模型解耦。value = {provider, model} 或 null（清空=跟随 agent 默认）
+  if (kind === 'judgeModel') {
+    if (op !== 'set') return { ok: false, error: 'judgeModel 使用 set 操作' }
+    if (value === null || value === undefined || value === '') {
+      config.judgeModel = null
+      saveJson(ALLOWLIST_PATH, config)
+      audit('CONFIG  judgeModel → (跟随 agent 默认模型)')
+      return { ok: true, set: true, value: null }
+    }
+    const provider = value && typeof value.provider === 'string' ? value.provider.trim() : ''
+    const model = value && typeof value.model === 'string' ? value.model.trim() : ''
+    if (!provider || !model) return { ok: false, error: 'judgeModel 需要 provider 与 model' }
+    config.judgeModel = { provider, model }
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  judgeModel → ${provider}/${model}`)
+    return { ok: true, set: true, value: config.judgeModel }
+  }
 
   // 数值类配置（阈值/超时）
   if (kind === 'riskyThreshold' || kind === 'judgeTimeoutMs') {
@@ -664,6 +683,16 @@ function normalizeConfig(raw) {
   cfg.riskyThreshold = cfg.riskyThreshold || 3
   cfg.judgeTimeoutMs = cfg.judgeTimeoutMs || 20000
   cfg.learning = cfg.learning || { enabled: true }
+  // judgeModel: optional dedicated model for Flash judgement, decoupled from the
+  // agent's own model. Absent/blank means "follow the agent default model".
+  // Anything malformed is dropped rather than kept, so a bad edit cannot make
+  // the gate throw — resolveModel() simply falls back.
+  const jm = cfg.judgeModel
+  cfg.judgeModel = (jm && typeof jm === 'object'
+    && typeof jm.provider === 'string' && jm.provider.trim() !== ''
+    && typeof jm.model === 'string' && jm.model.trim() !== '')
+    ? { provider: jm.provider.trim(), model: jm.model.trim() }
+    : null
   return cfg
 }
 
@@ -831,6 +860,58 @@ export default {
       }
     } catch (error) {
       console.error(`[${NAME}] 注册事件 API 失败`, error)
+    }
+
+    // ---- 判定模型列表 API（设置页：裁判模型下拉框） ----
+    // 与 DSH 对话框右下角的模型选择器同源：直接问 llm 服务要各 provider 的
+    // 模型目录（listModels 是广告式目录，按 adapter 声明的顺序返回）。
+    let offModelsRoute = null
+    try {
+      if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+        offModelsRoute = ctx.webServer.register({
+          kind: 'exact',
+          path: '/api/auto-approve/models',
+          handler: async (req, res) => {
+            const send = (code, obj) => {
+              res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-cache' })
+              res.end(JSON.stringify(obj))
+            }
+            if (req.method !== 'GET' && req.method !== 'HEAD') return send(405, { ok: false, error: 'method not allowed' })
+            try {
+              const providers = []
+              // listProviders() describes routes that actually have a registered
+              // adapter — exactly the ones a judge can call. (The sibling
+              // listConfigurableProviders() uses `provider` as its key field, so
+              // it is not a drop-in substitute.) Unregistered/dormant routes are
+              // intentionally excluded: selecting one would fail at judgement time.
+              const raw = typeof llm.listProviders === 'function' ? llm.listProviders() : []
+              for (const p of Array.isArray(raw) ? raw : []) {
+                const id = typeof p === 'string' ? p : (p && typeof p.id === 'string' ? p.id : '')
+                if (!id) continue
+                let models = []
+                try {
+                  const list = await llm.listModels(id)
+                  models = (Array.isArray(list) ? list : [])
+                    .map((m) => ({
+                      id: String(m && m.id ? m.id : ''),
+                      name: String(m && m.name ? m.name : (m && m.id ? m.id : '')),
+                    }))
+                    .filter((m) => m.id !== '')
+                } catch (error) {
+                  console.warn(`[${NAME}] listModels(${id}) 失败`, error)
+                }
+                providers.push({ id, models })
+              }
+              return send(200, { ok: true, providers, current: config.judgeModel || null })
+            } catch (error) {
+              return send(200, { ok: false, error: String((error && error.message) || error), providers: [], current: config.judgeModel || null })
+            }
+          },
+        })
+        console.log(`[${NAME}] 模型列表 API 已注册：/api/auto-approve/models`)
+      }
+    } catch (error) {
+      console.error(`[${NAME}] 注册模型列表 API 失败`, error)
     }
 
     // ---- 规则管理 API（设置页：查看/修改放行与阻塞规则 + 一键初始化） ----
@@ -1093,20 +1174,44 @@ export default {
       if (offRevertRoute) { try { offRevertRoute() } catch (e) {} }
       if (offSnapStatsRoute) { try { offSnapStatsRoute() } catch (e) {} }
       if (offSnapClearRoute) { try { offSnapClearRoute() } catch (e) {} }
+      if (offModelsRoute) { try { offModelsRoute() } catch (e) {} }
     })
 
+    /**
+     * Resolve the model used for Flash judgement.
+     *
+     * This is deliberately DECOUPLED from the agent's own model. The judge runs
+     * a single short question ("is this operation irreversible?"), so it wants a
+     * provider that answers in one request. The agent model may be a long
+     * multi-step tool loop (e.g. the antigravity/agy route), which can never
+     * finish inside `judgeTimeoutMs` — using it as the judge made every
+     * judgement fail-safe to manual approval.
+     *
+     * Resolution order:
+     *   1. `judgeModel` from allowlist.json, when it names a usable route.
+     *   2. The agent default model (previous behaviour, kept as fallback so an
+     *      unconfigured deployment is unaffected).
+     *   3. A built-in default.
+     * @returns the provider/model pair handed to `llm.stream`.
+     */
     const resolveModel = () => {
+      const jm = config.judgeModel
+      if (jm && typeof jm === 'object'
+        && typeof jm.provider === 'string' && jm.provider
+        && typeof jm.model === 'string' && jm.model) {
+        return { provider: jm.provider, model: jm.model, source: 'judgeModel' }
+      }
       try {
         const sel = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
           ? agentDefaultModel.currentSelection()
           : undefined
         if (sel && typeof sel.provider === 'string' && sel.provider && typeof sel.model === 'string' && sel.model) {
-          return { provider: sel.provider, model: sel.model }
+          return { provider: sel.provider, model: sel.model, source: 'agent-default' }
         }
       } catch (error) {
         console.error(`[${NAME}] agentDefaultModel.currentSelection() failed`, error)
       }
-      return { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+      return { provider: 'deepseek-official', model: 'deepseek-v4-flash', source: 'builtin' }
     }
 
     /**
@@ -1114,28 +1219,64 @@ export default {
      * 由 judgeOnce / verifySimilarity 共用；异常向上抛，由 withRetry 决定重试或降级。
      * @returns {Promise<string>} 模型原始输出文本
      */
+    /** True when the provider refused the requested reasoning effort. */
+    const isEffortRejection = (error) =>
+      /does not support reasoning effort/i.test(String(error && error.message ? error.message : error))
+
     const callFlash = async (userText, systemPrompt, signal) => {
       const { provider, model } = resolveModel()
-      let text = ''
-      for await (const chunk of llm.stream({
-        provider,
-        model,
-        messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
-        system: systemPrompt,
-        temperature: 0,
-        reasoningEffort: 'off',
-        // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
-        maxTokens: 256,
-        signal
-      })) {
-        if (chunk.type === 'text-delta') text += chunk.text
-        else if (chunk.type === 'reasoning-delta') text += chunk.text
-        else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+
+      /**
+       * One streaming attempt. The answer text is kept SEPARATE from the
+       * reasoning stream: thinking models emit a long reasoning-delta preamble
+       * (the agy bridge writes thinking-token markers there), and folding that
+       * into the judged text made parsing fail on every call.
+       */
+      const streamOnce = async (reasoningEffort) => {
+        let text = ''
+        let reasoning = ''
+        for await (const chunk of llm.stream({
+          provider,
+          model,
+          messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
+          system: systemPrompt,
+          temperature: 0,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
+          maxTokens: 256,
+          signal
+        })) {
+          if (chunk.type === 'text-delta') text += chunk.text
+          else if (chunk.type === 'reasoning-delta') reasoning += chunk.text
+          else if (chunk.type === 'finish') {
+            // `reason` is OPTIONAL: official providers send {kind:'stop'} on a
+            // normal end, some third-party providers omit it entirely. Reading
+            // chunk.reason.kind directly threw "Cannot read properties of
+            // undefined (reading 'kind')". An absent kind means a normal end.
+            const kind = chunk.reason && chunk.reason.kind ? chunk.reason.kind : ''
+            if (kind === 'error' || kind === 'aborted') {
+              const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : kind
+              throw new Error('flash 调用失败: ' + failure)
+            }
+          }
         }
+        // Prefer the answer channel; fall back to reasoning only when the
+        // provider produced no answer text at all.
+        return text.trim() !== '' ? text : reasoning
       }
-      return text
+
+      try {
+        return await streamOnce('off')
+      } catch (error) {
+        // `reasoningEffort` is per-model metadata, not a universal enum: each
+        // route advertises its own efforts list and rejects anything outside it
+        // (e.g. antigravity's gemini-3.8-flash offers only low/medium/high, so
+        // 'off' is always refused). The field is optional, and omitting it keeps
+        // the provider's own default, so retry without it.
+        if (!isEffortRejection(error)) throw error
+        console.warn(`[${NAME}] provider "${provider}" model "${model}" 不支持 reasoning effort "off"，改为不指定 effort 重试`)
+        return await streamOnce(undefined)
+      }
     }
 
     /**
@@ -1287,7 +1428,15 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          // Pass the Session itself: PermissionPresetService.current(session)
+          // resolves the "permissions" projection through
+          // stateOf(session) -> cellFor(reg, session), which reads
+          // session.header / session.snapshotEvents(). A Session exposes NO
+          // public `.events` property, so `session.events` handed `undefined`
+          // to the projection and threw "Cannot read properties of undefined
+          // (reading 'header')" — swallowed by the catch below, which silently
+          // disabled the whole gate.
+          preset = permissionPresets.current(session)
         } catch (error) {
           console.error(`[${NAME}] permissionPresets.current failed`, error)
           return next()
@@ -1300,7 +1449,13 @@ export default {
         const { mode, justification } = parseReason(reason)
         const sessionId = typeof session.id === 'string' ? session.id : ''
         // 会话工作目录：相对路径快照解析的基准（DSH SessionHeader.cwd）
-        const sessionCwd = (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        // cwd lives on SessionHeader, not on the Session object.
+        const sessionCwd = (() => {
+          const h = session.header
+          if (h && typeof h.cwd === 'string' && h.cwd) return h.cwd
+          // Older Session surfaces (or test doubles) may still expose .cwd.
+          return (typeof session.cwd === 'string' && session.cwd) ? session.cwd : ''
+        })()
         // B 层：callId 回溯 tool/call 事件取结构化真实路径（edit/write 的 file_path / bash 的 command）
         // C 层兜底：未命中时 recordApprovalEvent 内部回退 extractFiles(justification)
         const toolFiles = resolveToolCallFiles(req.callId, session.events)
