@@ -17,7 +17,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --check src/index.mjs && node --check client.js"
+    "test": "node --check src/index.mjs && node --check client.js && node test/session-api-contract.test.mjs",
+    "test:repro": "node test/repro-permission-presets-crash.mjs"
   },
   "keywords": [
     "deepseek-harness",
