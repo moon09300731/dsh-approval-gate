@@ -474,8 +474,12 @@ function ensureAutoApprovePreset() {
     }
 
     if (permIdx === -1) {
-      // 无 permission 条目：追加完整预设块
-      const next = text.replace(/\s*$/, '') + FULL_PERMISSION_BLOCK + AUTO_APPROVE_PRESET_YAML
+      // 无 permission 条目：追加完整预设块。
+      // 模板（PROFILE_PATCH_TEMPLATE）末尾的空数组占位符 [] 必须先去
+      // 掉：直接追加块序列会让同一个 YAML 文档出现两个顶层节点
+      // （[] 加 - id: ...），解析失败后 dsh 就挂载不起来。
+      const body = text.replace(/\s*$/, '').replace(/(^|\n)\[\]$/, '$1')
+      const next = body + FULL_PERMISSION_BLOCK + AUTO_APPROVE_PRESET_YAML
       writeFileSync(PROFILE_PATCH_PATH, next, 'utf8')
       return { ok: true, status: 'added-entry', needRestart: true }
     }
