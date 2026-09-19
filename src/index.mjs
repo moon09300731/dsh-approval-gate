@@ -23,7 +23,12 @@
  *   硬类别（前五个）→ 直接转人工；neutral（中立）→ 计数放行，第 N 次转人工裁决。
  *
  * 超时/失败处理：AbortController + signal 传给 llm.stream（可取消），
- *   超时或失败重试 1 次，仍失败 → 转人工（fail-safe）。
+ *   超时或失败重试 1 次，仍失败 → 转人工（fail-safe），并把失败原因写进审计与事件（judgeError）。
+ *
+ * 判定模型（v0.5.3+）：默认跟随当前默认模型；配置 judgeModel={provider,model} 可固定。
+ *   路由不支持 reasoning effort 'off' 时自动降级为「不带 effort」并记住该路由——
+ *   历史事故：默认模型切到不支持 'off' 的路由（GLM-5.3）后，判定器每次都在适配器解析阶段
+ *   抛 UNSUPPORTED_REASONING_EFFORT，全部请求 fail-safe 转人工，而界面上毫无提示。
  *
  * 数据文件（跨部署统一放到 DSH_HOME 下，node_modules 可能只读）：
  *   $DSH_HOME/auto-approve/allowlist.json  配置（denyKeywords/allowRules/denyRules/hardCategories/…）
@@ -371,6 +376,9 @@ function recordApprovalEvent(sessionId, toolName, mode, reason, justification, v
   if (o.category) ev.category = o.category
   // path：判定路径标识（hard-category / unknown-category / deny-rule / deny / flash-failed / neutral-reject / neutral-confirm）
   if (o.path) ev.path = o.path
+  // judgeError：判定器不可用的原因（fail-safe 转人工时写入，便于外部排查；
+  // 历史事故：判定器长期报错却只进 console，界面上完全看不出，只能看到「全都在弹人工」）
+  if (o.judgeError) ev.judgeError = String(o.judgeError).slice(0, 300)
   try {
     ensureDataDir()
     appendFileSync(EVENTS_PATH, JSON.stringify(ev) + '\n', 'utf8')
@@ -507,7 +515,7 @@ function ensureAutoApprovePreset() {
   }
 }
 
-/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs */
+/** 规则修改：op=add|remove|set，kind=allowRules|denyRules|denyKeywords|hardCategories|riskyThreshold|judgeTimeoutMs|judgeModel */
 function applyRuleOp(op, kind, value) {
   reloadConfig()
 
@@ -520,6 +528,24 @@ function applyRuleOp(op, kind, value) {
     saveJson(ALLOWLIST_PATH, config)
     audit(`CONFIG  ${kind} → ${n}`)
     return { ok: true, set: true, value: n }
+  }
+
+  // 判定模型（judgeModel）：{ provider, model }；传空值 = 清除，回到「跟随当前默认模型」
+  if (kind === 'judgeModel') {
+    if (op !== 'set') return { ok: false, error: 'judgeModel 使用 set 操作' }
+    const provider = String((value && value.provider) || '').trim()
+    const model = String((value && value.model) || '').trim()
+    if (!provider || !model) {
+      if (config.judgeModel === undefined) return { ok: false, error: 'judgeModel 需要 provider 与 model（传空值可清除）' }
+      delete config.judgeModel
+      saveJson(ALLOWLIST_PATH, config)
+      audit('CONFIG  judgeModel → 清除（跟随当前默认模型）')
+      return { ok: true, cleared: true }
+    }
+    config.judgeModel = { provider, model }
+    saveJson(ALLOWLIST_PATH, config)
+    audit(`CONFIG  judgeModel → ${provider}/${model}`)
+    return { ok: true, set: true, value: config.judgeModel }
   }
 
   const list = config[kind]
@@ -652,6 +678,32 @@ function audit(line) {
     ensureDataDir()
     appendFileSync(AUDIT_PATH, `[${new Date().toISOString()}] ${line}\n`, 'utf8')
   } catch { /* 审计失败不影响主流程 */ }
+}
+
+/**
+ * 识别「该路由不支持所请求的 reasoning effort」错误。
+ * 判定器调用链只把适配器失败的 message 透传出来（code 尽力保留），故文案与 code 双判。
+ * @param {unknown} error - 捕获到的异常
+ * @returns {boolean} 是否为 effort 不受支持
+ */
+function isUnsupportedEffortError(error) {
+  if (!error) return false
+  if (error.code === 'UNSUPPORTED_REASONING_EFFORT') return true
+  return /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort/i.test(String(error.message || error))
+}
+
+/**
+ * 压缩描述一个异常：优先「code: message」，无 code 时只留 message。
+ * 用于把判定器为什么不可用写进审计与事件（此前失败原因只进 console，外部不可见）。
+ * @param {unknown} error - 捕获到的异常
+ * @returns {string} 单行短描述
+ */
+function describeError(error) {
+  if (!error) return ''
+  const message = String((error && error.message) || error).replace(/\s+/g, ' ').trim()
+  const code = error && error.code ? String(error.code) : ''
+  const text = code && !message.startsWith(code) ? `${code}: ${message}` : message
+  return text.slice(0, 200)
 }
 
 // 首次加载时初始化配置文件；旧版（v1）自动补齐 v3 字段
@@ -1095,7 +1147,17 @@ export default {
       if (offSnapClearRoute) { try { offSnapClearRoute() } catch (e) {} }
     })
 
+    /**
+     * 判定模型来源：① 配置里显式钉住的 judgeModel（推荐，安全组件不随日常切模型漂移）
+     * ② 否则取当前默认模型；③ 都取不到则退回内置 Flash 路由。
+     */
     const resolveModel = () => {
+      const pinned = config.judgeModel
+      if (pinned && typeof pinned === 'object'
+        && typeof pinned.provider === 'string' && pinned.provider
+        && typeof pinned.model === 'string' && pinned.model) {
+        return { provider: pinned.provider, model: pinned.model }
+      }
       try {
         const sel = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
           ? agentDefaultModel.currentSelection()
@@ -1109,13 +1171,18 @@ export default {
       return { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
     }
 
+    // 判定路由不清一色支持 reasoning effort "off"：不支持的适配器会在解析阶段
+    // 直接抛 UNSUPPORTED_REASONING_EFFORT（无网络往返）。命中一次即记住该路由，
+    // 之后直接以「不带 reasoningEffort」调用（用路由默认档），不再每次白撞一次。
+    const noOffEffortRoutes = new Set()
+
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
      * 由 judgeOnce / verifySimilarity 共用；异常向上抛，由 withRetry 决定重试或降级。
+     * @param {string|undefined} effort - reasoning effort；undefined 表示用路由默认档
      * @returns {Promise<string>} 模型原始输出文本
      */
-    const callFlash = async (userText, systemPrompt, signal) => {
-      const { provider, model } = resolveModel()
+    const callFlashOnce = async (provider, model, userText, systemPrompt, signal, effort) => {
       let text = ''
       for await (const chunk of llm.stream({
         provider,
@@ -1123,7 +1190,7 @@ export default {
         messages: [{ role: 'user', content: [{ type: 'text', text: userText }] }],
         system: systemPrompt,
         temperature: 0,
-        reasoningEffort: 'off',
+        ...effort === undefined ? {} : { reasoningEffort: effort },
         // 256：结论仅几个词，但模型偶发先输出复述/思考文本，64 会被截断导致解析失败
         maxTokens: 256,
         signal
@@ -1131,11 +1198,33 @@ export default {
         if (chunk.type === 'text-delta') text += chunk.text
         else if (chunk.type === 'reasoning-delta') text += chunk.text
         else if (chunk.type === 'finish' && (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted')) {
-          const failure = chunk.reason.failure && chunk.reason.failure.message ? chunk.reason.failure.message : chunk.reason.kind
-          throw new Error('flash 调用失败: ' + failure)
+          const failure = chunk.reason.failure
+          const message = failure && failure.message ? failure.message : chunk.reason.kind
+          const error = new Error('flash 调用失败: ' + message)
+          if (failure && failure.code) error.code = failure.code
+          throw error
         }
       }
       return text
+    }
+
+    /**
+     * 判定调用入口：先试 'off'（不思考，最快且结论最干净），
+     * 路由不支持时降级为不带 effort 重调一次（fail-safe：宁可慢一点也不误判）。
+     */
+    const callFlash = async (userText, systemPrompt, signal) => {
+      const { provider, model } = resolveModel()
+      const routeKey = provider + '/' + model
+      if (!noOffEffortRoutes.has(routeKey)) {
+        try {
+          return await callFlashOnce(provider, model, userText, systemPrompt, signal, 'off')
+        } catch (error) {
+          if (!isUnsupportedEffortError(error)) throw error
+          noOffEffortRoutes.add(routeKey)
+          console.warn(`[${NAME}] 路由 ${routeKey} 不支持 reasoning effort "off"，改用该路由默认档（后续调用直接沿用）`)
+        }
+      }
+      return await callFlashOnce(provider, model, userText, systemPrompt, signal, undefined)
     }
 
     /**
@@ -1213,11 +1302,12 @@ export default {
 
     /**
      * 通用超时 + 重试包装：runFn(signal) 返回结果对象；
-     * 超时 abort 并重试 1 次，仍失败 → { failed: true }（调用方按 fail-safe 处理）。
+     * 超时 abort 并重试 1 次，仍失败 → { failed: true, error }（调用方按 fail-safe 处理）。
      * judgeOnce / verifySimilarity 共用；rejection 在 race 内消化（防 unhandled rejection）。
      */
     const withRetry = async (runFn, label) => {
       const timeoutMs = config.judgeTimeoutMs || 20000
+      let lastError = ''
       const runOnce = async () => {
         const controller = new AbortController()
         const timer = ctx.timeout(timeoutMs).then(() => {
@@ -1240,31 +1330,33 @@ export default {
         const first = await runOnce()
         if (!first.timedOut) return first
         console.warn(`[${NAME}] ${label} 超时(${timeoutMs}ms)，重试 1 次`)
+        lastError = `超时(${timeoutMs}ms)`
       } catch (error) {
         console.error(`[${NAME}] ${label} 异常，重试 1 次`, error)
+        lastError = describeError(error)
       }
       try {
         const second = await runOnce()
         if (!second.timedOut) return second
       } catch (error) {
         console.error(`[${NAME}] ${label} 重试仍异常`, error)
-        return { failed: true }
+        return { failed: true, error: lastError || describeError(error) }
       }
       console.warn(`[${NAME}] ${label} 两次超时(${timeoutMs}ms×2)`)
-      return { failed: true }
+      return { failed: true, error: `${lastError || '超时'}（重试 1 次仍失败）` }
     }
 
-    /** flash 风险判定（带超时重试）：失败 → { verdict:'risky', category:'neutral', failed:true }（fail-safe） */
+    /** flash 风险判定（带超时重试）：失败 → { verdict:'risky', category:'neutral', failed:true, error }（fail-safe） */
     const judgeWithFlash = async (toolName, mode, justification) => {
       const result = await withRetry((signal) => judgeOnce(toolName, mode, justification, signal), 'flash 判断')
-      if (result.failed) return { verdict: 'risky', category: 'neutral', timedOut: true, failed: true }
+      if (result.failed) return { verdict: 'risky', category: 'neutral', timedOut: true, failed: true, error: result.error }
       return result
     }
 
-    /** 同类验证（带超时重试）：失败 → { verdict:'different', failed:true }（fail-safe：验证失败按不同类处理） */
+    /** 同类验证（带超时重试）：失败 → { verdict:'different', failed:true, error }（fail-safe：验证失败按不同类处理） */
     const verifySimilarityWithRetry = async (toolName, mode, justification, samples) => {
       const result = await withRetry((signal) => verifySimilarity(toolName, mode, justification, samples, signal), '同类验证')
-      if (result.failed) return { verdict: 'different', failed: true }
+      if (result.failed) return { verdict: 'different', failed: true, error: result.error }
       return result
     }
 
@@ -1307,13 +1399,15 @@ export default {
         const filesOpt = toolFiles ? { files: toolFiles, baseDir: sessionCwd } : { baseDir: sessionCwd }
 
         // 转人工统一处理：记录 pending → 交下游（web answerer）→ 记录终态事件（关闭提示条）
-        const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why) => {
-          recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt))
+        // extra：附加到事件上的诊断字段（如判定器不可用的原因），供审查视图/排障读取
+        const forwardToHuman = async (sid, tName, tMode, rsn, jst, cat, why, extra) => {
+          const diagnostics = extra || {}
+          recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-pending', Object.assign({ kind: 'manual-pending', category: cat || '', path: why }, filesOpt, diagnostics))
           const out = await next()
           if (out === 'allowed-once') {
-            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt))
+            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-approved', Object.assign({ kind: 'manual-approved', category: cat || '', path: why }, filesOpt, diagnostics))
           } else if (out === 'rejected') {
-            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, filesOpt))
+            recordApprovalEvent(sid, tName, tMode, rsn, jst, 'manual-rejected', Object.assign({ kind: 'manual-rejected', category: cat || '', path: why }, filesOpt, diagnostics))
           }
           return out
         }
@@ -1333,7 +1427,7 @@ export default {
         }
 
         // 3. flash 判定
-        const { verdict, category, timedOut, failed } = await judgeWithFlash(toolName, mode, justification)
+        const { verdict, category, timedOut, failed, error: judgeError } = await judgeWithFlash(toolName, mode, justification)
 
         if (verdict === 'safe') {
           audit(`ALLOW   ${toolName} mode=${mode || 'none'} (flash-safe${timedOut ? '，重试后' : ''})`)
@@ -1344,9 +1438,10 @@ export default {
         const cat = category || 'neutral'
 
         // 4a. flash 完全失败（超时×2/异常×2）→ 转人工（fail-safe：无法判断绝不自动放行）
+        // 失败原因同时进审计与事件：此前只写 console，判定器长期不可用外部完全看不见
         if (failed) {
-          audit(`FAILED  ${toolName} mode=${mode || 'none'} → 人工 | ${reason.slice(0, 120)}`)
-          return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'flash-failed')
+          audit(`FAILED  ${toolName} mode=${mode || 'none'} → 人工 | 判定器不可用: ${judgeError || '未知原因'} | ${reason.slice(0, 120)}`)
+          return forwardToHuman(sessionId, toolName, mode, reason, justification, cat, 'flash-failed', judgeError ? { judgeError } : undefined)
         }
 
         // 4b. 硬风险类别（deletion/credential/remote/system/bulk）→ 直接转人工（必须人工确认，不计数不学习）

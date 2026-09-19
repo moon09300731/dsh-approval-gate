@@ -92,6 +92,7 @@ dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
+  "judgeModel": { "provider": "deepseek-official", "model": "deepseek-v4-flash" },
   "learning": { "enabled": true }
 }
 ```
@@ -102,6 +103,7 @@ dsh plugin --profile web add "github:moon09300731/dsh-approval-gate#main"
 - `hardCategories`：flash 判 RISKY 且命中这些类别 → 直接转人工（不计数、不学习）
 - `riskyThreshold`：中立类别的人工确认阈值（默认 3）——同一「工具+模式+类别」被人工确认 N-1 次后，第 N 次起自动放行并沉淀规则
 - `judgeTimeoutMs`：单次 flash 判断超时（默认 20000ms，超时自动重试 1 次，仍超时转人工）
+- `judgeModel`：**判定模型**（v0.5.3+，可选）。缺省时判定器跟随「当前默认模型」；填 `{provider, model}` 则固定用该路由判定。**推荐固定**：判定器是安全组件，不应随日常切换模型而漂移——默认模型一旦切到不支持 reasoning effort `off` 的路由（如 GLM-5.3），判定器会整体不可用（详见下节排查）
 
 ## 使用
 
@@ -169,13 +171,35 @@ DSH 设置面板新增「自动审批」分区（settings.section，样式与 DS
 - 挂载于 `approval/request` 瀑布最前（`prepend: true`，先于 web answerer 接单）
 - 门控：`permissionPresets.current(session.events) === 'auto-approve'`
 - DSH 审批触发点是沙箱越界，`reason` 固定为 `escalate sandbox to <mode>: <justification>`，`mode` 仅 `workspace-write` / `danger-full-access` 两级
-- flash 判定：`reasoningEffort: 'off'` + `maxTokens: 256`，输出 `SAFE` 或 `RISKY:<category>`
+- flash 判定：优先 `reasoningEffort: 'off'`（不思考、结论最干净）+ `maxTokens: 256`，输出 `SAFE` 或 `RISKY:<category>`；**路由不支持 `off` 档时自动降级为「不带 effort」调用一次并记住该路由**（v0.5.3+），不会因此整体不可用
 - 超时兜底：`AbortController` 传入 `llm.stream` 的 signal（可取消底层请求），`Promise.race` + `ctx.timeout(judgeTimeoutMs)`，超时 abort 并重试 1 次
 - 同类验证：把当前操作背景/目的 + 用户确认样本交给 flash 语义判断（`SAME`/`DIFFERENT`），失败按 DIFFERENT 处理
 - 学习闭环：通过 waterfall 的 `next()` 返回值捕获人工裁决结果（`allowed-once` 沉淀 / `rejected` 升级）
 - 审查 UI：host 写 `events.jsonl` + `GET /api/auto-approve/events`（按 sessionId 过滤 + since 增量）；client 轮询展示
 - 快照与 diff：审批发生在写入前，自动放行事件落盘时保存 `snapshots/<eventId>.json`（仅文本 ≤256KB、每事件 ≤5 个文件）；diff 用近似逐行匹配只返回变更行（上限 500 行）
 - 撤销投递：`sendToSession` 优先 `typertGateway.invoke({namespace:'session', method:'prompt'})`（queue 模式），失败回退 `agent.followup`
+
+## 排查：选了「自动审批」却仍在弹人工
+
+判定器（Flash）不可用时一律 fail-safe 转人工，所以**症状统一是「全都在弹人工」**，界面不报错。按顺序查：
+
+1. `~/.dsh/auto-approve/audit.log`：出现 `FAILED ... | 判定器不可用: <原因>` 即判定器在报错（v0.5.3+ 把原因写进审计；更早版本只写 console，外部完全看不见）
+2. `~/.dsh/auto-approve/events.jsonl`：对应事件带 `judgeError` 字段，审查视图读取同一份数据
+3. 常见原因：
+   - `... does not support reasoning effort "off"`：当前默认模型路由不支持 `off` 档（v0.5.3 起自动降级为默认档；仍建议用 `judgeModel` 固定判定路由）
+   - `MISSING_CREDENTIAL` / 鉴权失败：判定路由没有可用 API key
+   - 两次超时：`judgeTimeoutMs` 偏小或路由过慢
+4. 判据：审计里**只有 `FAILED` 没有 `ALLOW ... (flash-safe)`** → 判定器从未成功过，查第 1 条的原文
+
+固定判定模型（热更新，无需重启）：
+
+```bash
+curl -X POST http://127.0.0.1:3080/api/auto-approve/rules \
+  -H 'content-type: application/json' \
+  -d '{"op":"set","kind":"judgeModel","value":{"provider":"deepseek-official","model":"deepseek-v4-flash"}}'
+```
+
+传 `"value": {}` 可清除固定，回到「跟随当前默认模型」。
 
 ## License
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-approval-gate",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "DeepSeek Harness 自动审批门控：Flash 模型预判写入/命令是否不可回补，安全自动批准、危险转人工（fail-safe），最小人工介入，含人工审查 UI",
   "type": "module",
   "main": "./src/index.mjs",
@@ -17,7 +17,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --check src/index.mjs && node --check client.js"
+    "test": "node --check src/index.mjs && node --check client.js && node tests/judge-effort-fallback.mjs"
   },
   "keywords": [
     "deepseek-harness",

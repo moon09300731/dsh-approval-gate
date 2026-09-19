@@ -92,6 +92,7 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
   "hardCategories": ["deletion", "credential", "remote", "system", "bulk"],
   "riskyThreshold": 3,
   "judgeTimeoutMs": 20000,
+  "judgeModel": { "provider": "deepseek-official", "model": "deepseek-v4-flash" },
   "learning": { "enabled": true }
 }
 ```
@@ -102,6 +103,7 @@ Data files live under `$DSH_HOME/auto-approve/` (default `~/.dsh/auto-approve/`)
 - `hardCategories`: flash `RISKY` in these categories → directly human (no counting, no learning)
 - `riskyThreshold`: neutral confirmation threshold (default 3) — after N-1 human confirmations of the same tool+mode+category, the Nth occurrence auto-approves and persists a rule
 - `judgeTimeoutMs`: single flash judgment timeout (default 20000ms; auto-retries once, then goes to human)
+- `judgeModel`: **the judging route** (v0.5.3+, optional). Unset, the judge follows the current default model; set to `{provider, model}` to pin one route. **Pinning is recommended**: the judge is a safety component and should not drift with everyday model switching — a default model whose route rejects reasoning effort `off` (e.g. GLM-5.3) disables the judge entirely (see troubleshooting below)
 
 ## Usage
 
@@ -169,13 +171,35 @@ Neutral confirmation learning: each human approval of the same tool|mode|categor
 - Mounted at the front of the `approval/request` waterfall (`prepend: true`, before the web answerer)
 - Gate: `permissionPresets.current(session.events) === 'auto-approve'`
 - DSH approval fires on sandbox escalation; `reason` is always `escalate sandbox to <mode>: <justification>`, with `mode` in `workspace-write` / `danger-full-access`
-- flash judgment: `reasoningEffort: 'off'` + `maxTokens: 256`, outputs `SAFE` or `RISKY:<category>`
+- flash judgment: `reasoningEffort: 'off'` first (no thinking, cleanest verdict) + `maxTokens: 256`, outputs `SAFE` or `RISKY:<category>`; when the route rejects the `off` effort the judge **falls back to a call without any effort once and remembers that route** (v0.5.3+), so it can never be disabled by an effort mismatch
 - Timeout: `AbortController` signal into `llm.stream` (cancellable), `Promise.race` + `ctx.timeout(judgeTimeoutMs)`, abort + one retry
 - Similarity verification: current operation context + confirmed samples to flash (`SAME`/`DIFFERENT`); failure counts as DIFFERENT
 - Learning loop: captures human verdicts through the waterfall `next()` return (`allowed-once` persists / `rejected` upgrades)
 - Review UI: host writes `events.jsonl` + `GET /api/auto-approve/events` (sessionId filter + since cursor); client polls and renders
 - Snapshots & diff: approval happens before the write, so the auto-approval event saves `snapshots/<eventId>.json` at record time (text only, ≤256KB per file, ≤5 per event); diff uses approximate line matching and returns changed lines only (up to 500)
 - Revert delivery: `sendToSession` prefers `typertGateway.invoke({namespace:'session', method:'prompt'})` (queue mode), falling back to `agent.followup`
+
+## Troubleshooting: "Auto Approval" selected but everything still asks a human
+
+When the judge (Flash) is unusable it always fail-safes to a human, so **the symptom is always "everything asks a human"** with no visible error. Check in order:
+
+1. `~/.dsh/auto-approve/audit.log`: a line `FAILED ... | 判定器不可用: <reason>` means the judge is erroring (v0.5.3+ writes the reason to the audit log; earlier versions only wrote console output, invisible from outside)
+2. `~/.dsh/auto-approve/events.jsonl`: the matching event carries a `judgeError` field — the same data the review UI reads
+3. Common causes:
+   - `... does not support reasoning effort "off"`: the current default model route rejects the `off` effort (v0.5.3+ degrades automatically; pinning `judgeModel` is still recommended)
+   - `MISSING_CREDENTIAL` / auth failure: no usable API key for the judging route
+   - two timeouts: `judgeTimeoutMs` too small, or the route too slow
+4. Tell-tale sign: the audit log has **only `FAILED` and no `ALLOW ... (flash-safe)`** → the judge has never succeeded; read the reason from step 1
+
+Pin the judging route (hot-reloaded, no restart):
+
+```bash
+curl -X POST http://127.0.0.1:3080/api/auto-approve/rules \
+  -H 'content-type: application/json' \
+  -d '{"op":"set","kind":"judgeModel","value":{"provider":"deepseek-official","model":"deepseek-v4-flash"}}'
+```
+
+Pass `"value": {}` to clear the pin and follow the current default model again.
 
 ## License
 
