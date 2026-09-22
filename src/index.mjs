@@ -1095,19 +1095,7 @@ export default {
       if (offSnapClearRoute) { try { offSnapClearRoute() } catch (e) {} }
     })
 
-    const resolveModel = () => {
-      try {
-        const sel = agentDefaultModel && typeof agentDefaultModel.currentSelection === 'function'
-          ? agentDefaultModel.currentSelection()
-          : undefined
-        if (sel && typeof sel.provider === 'string' && sel.provider && typeof sel.model === 'string' && sel.model) {
-          return { provider: sel.provider, model: sel.model }
-        }
-      } catch (error) {
-        console.error(`[${NAME}] agentDefaultModel.currentSelection() failed`, error)
-      }
-      return { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
-    }
+    const resolveModel = () => ({ provider: 'deepseek-official', model: 'deepseek-v4-flash' })
 
     /**
      * 底层 flash 调用：流式请求并累积文本输出（可取消）。
@@ -1287,7 +1275,7 @@ export default {
         if (!session) return next()
         let preset
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
           console.error(`[${NAME}] permissionPresets.current failed`, error)
           return next()
