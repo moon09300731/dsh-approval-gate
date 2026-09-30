@@ -42,7 +42,12 @@ const LEARNING_PATH = join(DATA_DIR, 'learning.json')
 const AUDIT_PATH = join(DATA_DIR, 'audit.log')
 const EVENTS_PATH = join(DATA_DIR, 'events.jsonl')
 const SNAPSHOTS_DIR = join(DATA_DIR, 'snapshots')
-const PROFILE_PATCH_PATH = join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+// 0.2.0 适配：profile 目录随运行环境变化（desktop / web），不能写死 web。
+// DSH_PROFILE_DIR 由 DSH 注入；无则回退 DSH_PROFILE，再回退 web。
+// 写死 web 会导致在 desktop profile 下"一键初始化权限预设"把配置写到错误的 profile。
+const PROFILE_DIR = process.env.DSH_PROFILE_DIR
+  || join(DSH_HOME, 'profiles', process.env.DSH_PROFILE || 'web')
+const PROFILE_PATCH_PATH = join(PROFILE_DIR, 'cordis.patch.yml')
 
 // 快照限制：单文件 ≤256KB、每事件 ≤5 个文件
 const SNAPSHOT_MAX_BYTES = 256 * 1024
