@@ -33,6 +33,7 @@
 import { readFileSync, writeFileSync, existsSync, appendFileSync, mkdirSync, readdirSync, statSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const NAME = 'dsh-approval-gate'
 const DSH_HOME = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -42,7 +43,61 @@ const LEARNING_PATH = join(DATA_DIR, 'learning.json')
 const AUDIT_PATH = join(DATA_DIR, 'audit.log')
 const EVENTS_PATH = join(DATA_DIR, 'events.jsonl')
 const SNAPSHOTS_DIR = join(DATA_DIR, 'snapshots')
-const PROFILE_PATCH_PATH = join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml')
+// 0.2.x 起 profile 名随发行形态变化（官方桌面版=desktop / Web=web / headless=headless）。
+// 此前写死 profiles/web：桌面版下「一键配置」写到别的 profile、设置页永远显示未配置（issue #2、#25）。
+const PROFILE_ORDER = ['desktop', 'headless', 'web']
+
+/** 本插件是被哪个 profile 安装并加载的：看自身模块路径里的 profiles/<name>/node_modules */
+function installedProfileName() {
+  try {
+    const parts = fileURLToPath(import.meta.url).split(/[\\/]/)
+    const i = parts.lastIndexOf('profiles')
+    if (i >= 0 && parts[i + 1] && parts[i + 2] === 'node_modules') return parts[i + 1]
+  } catch { /* 非 file: 协议或测试环境 → 走环境变量/扫描兜底 */ }
+  return ''
+}
+
+/** 所有「确实存在 cordis.patch.yml」的 profile 名 */
+function profilePatchCandidates() {
+  const root = join(DSH_HOME, 'profiles')
+  const names = []
+  try {
+    for (const name of readdirSync(root)) {
+      try {
+        if (statSync(join(root, name, 'cordis.patch.yml')).isFile()) names.push(name)
+      } catch { /* 该目录没有 patch 文件 */ }
+    }
+  } catch { /* 没有 profiles 目录 */ }
+  return names
+}
+
+/**
+ * 解析当前生效 profile 的 cordis.patch.yml 路径。
+ * 顺序：自身安装路径 → DSH_PROFILE_DIR → DSH_PROFILE → 目录扫描唯一候选 → 按发行形态猜测 → profiles/web 兜底。
+ * 多 profile 同时有 patch 文件时标 ambiguous（issue #6 的教训：猜错目录会写坏别人的配置文件）。
+ */
+function resolveProfilePatchPath() {
+  const candidates = profilePatchCandidates()
+  const self = installedProfileName()
+  if (self) return { path: join(DSH_HOME, 'profiles', self, 'cordis.patch.yml'), profile: self, source: 'installed-path', candidates, ambiguous: false }
+
+  const envDir = process.env.DSH_PROFILE_DIR ? String(process.env.DSH_PROFILE_DIR).trim() : ''
+  if (envDir) {
+    const name = envDir.split(/[\\/]/).filter(Boolean).pop() || ''
+    return { path: join(envDir, 'cordis.patch.yml'), profile: name, source: 'env:DSH_PROFILE_DIR', candidates, ambiguous: false }
+  }
+
+  const envName = process.env.DSH_PROFILE ? String(process.env.DSH_PROFILE).trim() : ''
+  if (envName) return { path: join(DSH_HOME, 'profiles', envName, 'cordis.patch.yml'), profile: envName, source: 'env:DSH_PROFILE', candidates, ambiguous: false }
+
+  if (candidates.length === 1) return { path: join(DSH_HOME, 'profiles', candidates[0], 'cordis.patch.yml'), profile: candidates[0], source: 'scan', candidates, ambiguous: false }
+
+  const preferred = PROFILE_ORDER.find((n) => candidates.includes(n))
+  if (preferred) {
+    return { path: join(DSH_HOME, 'profiles', preferred, 'cordis.patch.yml'), profile: preferred, source: 'scan:guess', candidates, ambiguous: candidates.length > 1 }
+  }
+  return { path: join(DSH_HOME, 'profiles', 'web', 'cordis.patch.yml'), profile: '', source: 'fallback', candidates, ambiguous: false }
+}
 
 // 快照限制：单文件 ≤256KB、每事件 ≤5 个文件
 const SNAPSHOT_MAX_BYTES = 256 * 1024
@@ -453,18 +508,20 @@ function getRulesSnapshot() {
 
 /** 检查权限预设是否已配置（供设置页初始化卡片） */
 function getSetupState() {
+  const { path: patchPath, profile, source, candidates, ambiguous } = resolveProfilePatchPath()
   try {
-    const text = readFileSync(PROFILE_PATCH_PATH, 'utf8')
-    return { configured: text.includes('auto-approve:'), patchPath: PROFILE_PATCH_PATH }
+    const text = readFileSync(patchPath, 'utf8')
+    return { configured: text.includes('auto-approve:'), patchPath, profile, source, candidates, ambiguous }
   } catch (e) {
-    return { configured: false, patchPath: PROFILE_PATCH_PATH, error: String((e && e.message) || e) }
+    return { configured: false, patchPath, profile, source, candidates, ambiguous, error: String((e && e.message) || e) }
   }
 }
 
 /** 一键初始化：在 cordis.patch.yml 中写入 auto-approve 权限预设（文本级操作，保留注释格式） */
 function ensureAutoApprovePreset() {
+  const { path: patchPath } = resolveProfilePatchPath()
   try {
-    const text = readFileSync(PROFILE_PATCH_PATH, 'utf8')
+    const text = readFileSync(patchPath, 'utf8')
     if (text.includes('auto-approve:')) return { ok: true, status: 'already', needRestart: false }
 
     const lines = text.split('\n')
@@ -476,7 +533,7 @@ function ensureAutoApprovePreset() {
     if (permIdx === -1) {
       // 无 permission 条目：追加完整预设块
       const next = text.replace(/\s*$/, '') + FULL_PERMISSION_BLOCK + AUTO_APPROVE_PRESET_YAML
-      writeFileSync(PROFILE_PATCH_PATH, next, 'utf8')
+      writeFileSync(patchPath, next, 'utf8')
       return { ok: true, status: 'added-entry', needRestart: true }
     }
 
@@ -500,7 +557,7 @@ function ensureAutoApprovePreset() {
       if (/^\s*$/.test(line)) continue
     }
     lines.splice(insertAt + 1, 0, AUTO_APPROVE_PRESET_YAML.replace(/\n$/, ''))
-    writeFileSync(PROFILE_PATCH_PATH, lines.join('\n'), 'utf8')
+    writeFileSync(patchPath, lines.join('\n'), 'utf8')
     return { ok: true, status: 'added-preset', needRestart: true }
   } catch (e) {
     return { ok: false, status: 'error', needRestart: false, error: String((e && e.message) || e) }
@@ -1285,11 +1342,30 @@ export default {
         reloadConfig()
         const session = req.agent && req.agent.session
         if (!session) return next()
+        // 0.2.x 的签名是 current(session)；0.1.x 是 current(events)。
+        // 只传 session.events 时，0.2.x 下抛错并被就地吞掉 → 门控静默失效（issues #2/#3/#5/#15/#17/#21/#25）。
         let preset
+        let presetError = null
         try {
-          preset = permissionPresets.current(session.events)
+          preset = permissionPresets.current(session)
         } catch (error) {
-          console.error(`[${NAME}] permissionPresets.current failed`, error)
+          presetError = error
+        }
+        // session.events 在 0.2.x 已移除；取用时自身也可能抛错，故先安全取一次。
+        let legacyEvents = null
+        try { legacyEvents = session.events } catch { legacyEvents = null }
+        if (typeof preset !== 'string' && Array.isArray(legacyEvents)) {
+          try {
+            preset = permissionPresets.current(legacyEvents)
+            presetError = null
+          } catch (error) {
+            presetError = error
+          }
+        }
+        if (presetError) {
+          const detail = String((presetError && presetError.message) || presetError)
+          audit(`ERROR   permissionPresets.current failed: ${detail} → 降级人工（本次审批未接管）`)
+          console.error(`[${NAME}] permissionPresets.current failed`, presetError)
           return next()
         }
         if (preset !== PRESET_NAME) return next()
